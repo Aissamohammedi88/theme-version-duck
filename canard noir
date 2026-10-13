@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# ============================================================
+# NEXUS ANIM — Bureau vivant, réactif, animé
+# Combine : frames animées + xwinwrap + conky overlay
+# Usage : bash nexus-anim.sh
+# ============================================================
+set -euo pipefail
+
+H="$HOME/NexusCinema"
+W="$H/walls"
+FR="$H/frames"
+DB="$H/data/cinema.db"
+LOG="$H/logs/nexus.log"
+S="$H/scripts/nexus-cinema.sh"
+QS="$H/scripts/quantum.sh"
+ANIM="$H/scripts/anim.sh"
+OVERLAY="$H/scripts/overlay.sh"
+
+echo "▸ NEXUS ANIM — initialisation"
+mkdir -p "$W" "$FR" "$H/data" "$H/logs" "$H/scripts" "$H/state" \
+         "$HOME/.config/systemd/user" "$HOME/.config/autostart"
+
+# ------------------------------------------------------------
+# 1) BASE : ajout de la table frames
+# ------------------------------------------------------------
+sqlite3 "$DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS frames(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wall_id INTEGER,
+  path TEXT UNIQUE,
+  ordre INTEGER,
+  FOREIGN KEY(wall_id) REFERENCES walls(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS animation(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wall_id INTEGER,
+  fps INTEGER DEFAULT 2,
+  boucle INTEGER DEFAULT 1,
+  actif INTEGER DEFAULT 1
+);
+SQL
+
+# ------------------------------------------------------------
+# 2) GÉNÉRATEUR DE FRAMES ANIMÉES
+# ------------------------------------------------------------
+RES_W=1920
+RES_H=1080
+
+gen_frame() {
+  local file="$1" seed="$2" titre="$3" sous="$4" c1="$5" c2="$6" c3="$7"
+  local phase="$8"      # phase d'animation (0..N) pour faire bouger
+  local total="$9"
+
+  RANDOM=$seed
+
+  local n_stars=$(( RANDOM % 200 + 250 ))
+  local n_neb=$(( RANDOM % 4 + 3 ))
+
+  # Décalage animé
+  local shift_x=$(( phase * 30 ))
+  local shift_y=$(( phase * 15 ))
+  local pulse=$(( phase % 10 ))
+  local opacity_core
+  opacity_core=$(awk "BEGIN { printf \"%.2f\", 0.5 + 0.3*sin($phase/3) }")
+
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"$RES_W\" height=\"$RES_H\" viewBox=\"0 0 $RES_W $RES_H\">"
+    cat <<DEFS
+  <defs>
+    <radialGradient id="bg" cx="0.5" cy="0.5" r="0.75">
+      <stop offset="0%" stop-color="$c1" stop-opacity="0.6"/>
+      <stop offset="50%" stop-color="$c2" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="$c3"/>
+    </radialGradient>
+    <radialGradient id="core" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="white" stop-opacity="$opacity_core"/>
+      <stop offset="30%" stop-color="$c1" stop-opacity="0.7"/>
+      <stop offset="100%" stop-color="$c1" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="starGlow"><feGaussianBlur stdDeviation="1.5"/></filter>
+    <filter id="nebGlow"><feGaussianBlur stdDeviation="60"/></filter>
+    <filter id="deepBlur"><feGaussianBlur stdDeviation="120"/></filter>
+  </defs>
+DEFS
+
+    echo "  <rect width=\"$RES_W\" height=\"$RES_H\" fill=\"$c3\"/>"
+    echo "  <rect width=\"$RES_W\" height=\"$RES_H\" fill=\"url(#bg)\"/>"
+
+    # Nébuleuses qui tournent lentement
+    echo "  <g filter=\"url(#nebGlow)\" opacity=\"0.5\">"
+    for i in $(seq 1 $n_neb); do
+      local cx=$(( (RANDOM % RES_W + shift_x) % RES_W ))
+      local cy=$(( (RANDOM % RES_H + shift_y) % RES_H ))
+      local r=$(( RANDOM % 250 + 150 ))
+      local col
+      case $(( RANDOM % 3 )) in 0) col="$c1";; 1) col="$c2";; 2) col="white";; esac
+      echo "    <circle cx=\"$cx\" cy=\"$cy\" r=\"$r\" fill=\"$col\" opacity=\"0.4\"/>"
+    done
+    echo "  </g>"
+
+    # Voie lactée qui pulse
+    echo "  <g filter=\"url(#deepBlur)\" opacity=\"0.7\">"
+    echo "    <ellipse cx=\"$((RES_W/2 + shift_x))\" cy=\"$((RES_H/2 + shift_y))\" rx=\"900\" ry=\"180\" fill=\"$c1\" opacity=\"0.4\" transform=\"rotate(-25 $((RES_W/2)) $((RES_H/2)))\"/>"
+    echo "  </g>"
+
+    # Étoiles qui scintillent
+    echo "  <g filter=\"url(#starGlow)\">"
+    for i in $(seq 1 $n_stars); do
+      local sx=$(( RANDOM % RES_W ))
+      local sy=$(( RANDOM % RES_H ))
+      local sr
+      local roll=$(( (RANDOM + phase) % 100 ))
+      if (( roll < 80 )); then sr="1"; elif (( roll < 95 )); then sr="1.5"; else sr="2.5"; fi
+      local op=$(( (RANDOM + phase * 7) % 5 + 5 ))
+      echo "    <circle cx=\"$sx\" cy=\"$sy\" r=\"$sr\" fill=\"white\" opacity=\"0.$op\"/>"
+    done
+    echo "  </g>"
+
+    # Cœur qui bat
+    local corex=$(( RES_W / 2 + shift_x ))
+    local corey=$(( RES_H / 2 + shift_y ))
+    echo "  <circle cx=\"$corex\" cy=\"$corey\" r=\"400\" fill=\"url(#core)\" opacity=\"0.6\"/>"
+    echo "  <circle cx=\"$corex\" cy=\"$corey\" r=\"$((60 + pulse * 4))\" fill=\"white\" opacity=\"0.4\" filter=\"url(#nebGlow)\"/>"
+
+    # Titre
+    cat <<TITLE
+  <rect x="0" y="$((RES_H-260))" width="$RES_W" height="260" fill="black" opacity="0.55"/>
+  <text x="80" y="$((RES_H-140))" font-family="DejaVu Sans, sans-serif" font-size="78" font-weight="100" fill="white" opacity="0.95" letter-spacing="4">$titre</text>
+  <text x="80" y="$((RES_H-70))" font-family="DejaVu Sans, sans-serif" font-size="26" font-weight="300" fill="$c1" opacity="0.9" letter-spacing="8">$sous</text>
+  <text x="$((RES_W-80))" y="100" text-anchor="end" font-family="DejaVu Sans Mono, monospace" font-size="18" fill="white" opacity="0.55">NEXUS // ANIM // FRAME $phase/$total</text>
+</svg>
+TITLE
+  } > "$file"
+}
+
+convert_svg() {
+  local svg="$1"
+  local png="${svg%.svg}.png"
+  if command -v rsvg-convert >/dev/null 2>&1; then
+    rsvg-convert -w "$RES_W" -h "$RES_H" "$svg" -o "$png" 2>/dev/null && { echo "$png"; return; }
+  fi
+  if command -v inkscape >/dev/null 2>&1; then
+    inkscape "$svg" --export-type=png --export-filename="$png" -w "$RES_W" -h "$RES_H" 2>/dev/null && { echo "$png"; return; }
+  fi
+  if command -v convert >/dev/null 2>&1; then
+    convert -background none "$svg" "$png" 2>/dev/null && { echo "$png"; return; }
+  fi
+  echo "$svg"
+}
+
+# ------------------------------------------------------------
+# 3) GÉNÉRATION : 12 galaxies × 8 frames = 96 images
+# ------------------------------------------------------------
+echo "▸ Génération de galaxies animées (12 × 8 frames)..."
+
+declare -a GALAXIES=(
+  "ANDROMEDE|#a78bfa|#7c3aed|#0a0014|SPECTRE"
+  "ORION|#60a5fa|#1e40af|#000814|NEBULEUSE"
+  "CARENE|#f472b6|#be185d|#1a0010|VOILE"
+  "SAGITTARIUS|#fbbf24|#d97706|#0f0800|COEUR"
+  "HELIX|#22d3ee|#0891b2|#000a12|OEIL"
+  "CRAB|#fb7185|#9f1239|#150005|PULSAR"
+  "SOMBRERO|#fcd34d|#92400e|#0a0500|DISQUE"
+  "WHIRLPOOL|#34d399|#047857|#000a06|SPIRALE"
+  "CENTAURUS|#c084fc|#7e22ce|#0d0014|NOYAU"
+  "PINWHEEL|#e0e7ff|#6366f1|#050014|VOIE"
+  "BLACK-EYE|#94a3b8|#334155|#000000|SILENCE"
+  "ANTENNES|#f97316|#c2410c|#100300|FUSION"
+)
+
+FRAMES_PER=8
+
+for entry in "${GALAXIES[@]}"; do
+  IFS='|' read -r id c1 c2 c3 sous <<< "$entry"
+  gal_dir="$FR/${id,,}"
+  mkdir -p "$gal_dir"
+  seed=$(( RANDOM ))
+
+  # Insérer la galaxie dans walls (représentée par sa frame 0)
+  for f in $(seq 0 $(( FRAMES_PER - 1 ))); do
+    svg="$gal_dir/frame_${f}.svg"
+    gen_frame "$svg" "$seed" "$id" "$sous" "$c1" "$c2" "$c3" "$f" "$FRAMES_PER"
+    png=$(convert_svg "$svg")
+    # Renomme la frame vers son nom définitif
+    final_frame="$gal_dir/frame_${f}$(basename "$png" | grep -oE '\.[a-z]+$')"
+    [[ "$png" != "$final_frame" ]] && mv "$png" "$final_frame" 2>/dev/null || true
+    echo "$final_frame"
+  done > "$gal_dir/frames.list"
+
+  first=$(head -n1 "$gal_dir/frames.list")
+  sqlite3 "$DB" "INSERT OR IGNORE INTO walls(path,label,mood) VALUES('$first','$id — animé','galaxy');"
+  wid=$(sqlite3 "$DB" "SELECT id FROM walls WHERE path='$first' LIMIT 1;")
+
+  # Enregistrer chaque frame
+  while read -r fp; do
+    [[ -z "$fp" ]] && continue
+    sqlite3 "$DB" "INSERT OR IGNORE INTO frames(wall_id,path,ordre) VALUES($wid,'$fp',0);"
+  done < "$gal_dir/frames.list"
+
+  sqlite3 "$DB" "INSERT OR IGNORE INTO animation(wall_id,fps,boucle,actif) VALUES($wid,2,1,1);"
+  echo "  ✓ $id (${FRAMES_PER} frames)"
+done
+
+# ------------------------------------------------------------
+# 4) MOTEUR D'ANIMATION (changement rapide de frames)
+# ------------------------------------------------------------
+cat > "$ANIM" <<'ANIM_SCRIPT'
+#!/usr/bin/env bash
+# Anime le bureau : change les frames en boucle
+set -euo pipefail
+H="$HOME/NexusCinema"; DB="$H/data/cinema.db"; LOG="$H/logs/nexus.log"
+ST="$H/state/anim.state"
+
+# Choisir une galaxie (rotation)
+GAL=$(sqlite3 "$DB" "SELECT w.id||'|'||w.label FROM walls w
+                     JOIN animation a ON a.wall_id=w.id
+                     WHERE a.actif=1 AND w.actif=1
+                     ORDER BY RANDOM() LIMIT 1;")
+[[ -z "$GAL" ]] && { echo "aucune galaxie animée"; exit 1; }
+IFS='|' read -r GID GLABEL <<< "$GAL"
+
+# Charger les frames
+mapfile -t FRAMES < <(sqlite3 "$DB" "SELECT path FROM frames WHERE wall_id=$GID ORDER BY ordre,id;")
+[[ ${#FRAMES[@]} -eq 0 ]] && { echo "aucune frame"; exit 1; }
+
+# Boucler N cycles
+CYCLES="${1:-3}"
+for (( c=0; c<CYCLES; c++ )); do
+  for f in "${FRAMES[@]}"; do
+    [[ ! -f "$f" ]] && continue
+    gsettings set org.cinnamon.desktop.background picture-uri "file://$f" 2>/dev/null \
+    || gsettings set org.gnome.desktop.background picture-uri "file://$f" 2>/dev/null \
+    || true
+    sleep 0.4
+  done
+done
+
+echo "$GLABEL|$(date +%s)" > "$ST"
+echo "✓ Animé : $GLABEL (${#FRAMES[@]} frames × $CYCLES cycles)"
+echo "[$(date)] animé $GLABEL ${#FRAMES[@]}f×$CYCLES" >> "$LOG"
+ANIM_SCRIPT
+chmod +x "$ANIM"
+
+# ------------------------------------------------------------
+# 5) OVERLAY CONKY (éléments vivants par-dessus)
+# ------------------------------------------------------------
+if command -v conky >/dev/null 2>&1; then
+  mkdir -p "$HOME/.config/conky"
+  cat > "$HOME/.config/conky/nexus.conf" <<'CONKY'
+conky.config = {
+    alignment = 'top_right',
+    background = false,
+    border_width = 0,
+    cpu_avg_samples = 2,
+    default_color = 'white',
+    default_outline_color = 'black',
+    default_shade_color = 'black',
+    draw_borders = false,
+    draw_graph_borders = true,
+    draw_outline = false,
+    draw_shades = false,
+    use_xft = true,
+    font = 'DejaVu Sans Mono:size=10',
+    gap_x = 30,
+    gap_y = 60,
+    minimum_height = 5,
+    minimum_width = 260,
+    net_avg_samples = 2,
+    no_buffers = true,
+    out_to_console = false,
+    out_to_stderr = false,
+    extra_newline = false,
+    own_window = true,
+    own_window_class = 'Conky',
+    own_window_type = 'desktop',
+    own_window_transparent = true,
+    own_window_argb_visual = true,
+    own_window_argb_value = 120,
+    own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
+    stippled_borders = 0,
+    update_interval = 1.0,
+    uppercase = false,
+    use_spacer = 'none',
+    show_graph_scale = false,
+    show_graph_range = false,
+}
+
+conky.text = [[
+${color #a78bfa}╔═══ NEXUS // GALAXY ═══╗${color}
+${color #c084fc} HEURE  ${color}${time %H:%M:%S}
+${color #c084fc} DATE   ${color}${time %A %d %B}
+${color #22d3ee} CPU    ${color}${cpu cpu0}% ${cpubar cpu0 6,180}
+${color #34d399} RAM    ${color}$mem / $memmax  ${membar 6,180}
+${color #fbbf24} DISQUE ${color}${fs_used /} / ${fs_size /}
+${color #fb7185} RÉSEAU ${color}↓${downspeedf wlp2s0} ↑${upspeedf wlp2s0} Ko/s
+${color #a78bfa}╚════════════════════════╝${color}
+]]
+CONKY
+  echo "  ✓ Overlay conky configuré"
+  HAS_CONKY=1
+else
+  echo "  ⚠ conky absent — overlay désactivé (sudo apt install conky-all pour l'activer)"
+  HAS_CONKY=0
+fi
+
+cat > "$OVERLAY" <<OVERLAY_SCRIPT
+#!/usr/bin/env bash
+# Lance/arrête l'overlay conky
+set -euo pipefail
+case "\${1:-start}" in
+  start)
+    pkill -f "conky.*nexus.conf" 2>/dev/null || true
+    sleep 0.5
+    conky -c "\$HOME/.config/conky/nexus.conf" -d 2>/dev/null || true
+    echo "✓ Overlay actif"
+    ;;
+  stop)
+    pkill -f "conky.*nexus.conf" 2>/dev/null || true
+    echo "✓ Overlay arrêté"
+    ;;
+esac
+OVERLAY_SCRIPT
+chmod +x "$OVERLAY"
+
+# ------------------------------------------------------------
+# 6) MOTEUR PRINCIPAL UNIFIÉ
+# ------------------------------------------------------------
+cat > "$S" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+H="$HOME/NexusCinema"
+QS="$H/scripts/quantum.sh"
+ANIM="$H/scripts/anim.sh"
+OVERLAY="$H/scripts/overlay.sh"
+
+case "${1:-run}" in
+  run|next|quantum)  bash "$QS" ;;
+  anim)              bash "$ANIM" "${2:-3}" ;;
+  overlay)           bash "$OVERLAY" "${2:-start}" ;;
+  vivant)
+    bash "$ANIM" 2
+    bash "$OVERLAY" start
+    ;;
+  list)     sqlite3 -column -header "$H/data/cinema.db" "SELECT id,label,vues FROM walls ORDER BY id;" ;;
+  frames)   sqlite3 -column -header "$H/data/cinema.db" "SELECT wall_id,COUNT(*) FROM frames GROUP BY wall_id;" ;;
+  states)   sqlite3 -column -header "$H/data/cinema.db" "SELECT ts,etat FROM quantum_states ORDER BY id DESC LIMIT 20;" ;;
+  *)        bash "$QS" ;;
+esac
+SCRIPT
+chmod +x "$S"
+
+# ------------------------------------------------------------
+# 7) ALIAS
+# ------------------------------------------------------------
+grep -q "alias nexus=" "$HOME/.bashrc" 2>/dev/null || echo "alias nexus='$S'" >> "$HOME/.bashrc"
+grep -q "alias vivant=" "$HOME/.bashrc" 2>/dev/null || echo "alias vivant='$S vivant'" >> "$HOME/.bashrc"
+grep -q "alias anime=" "$HOME/.bashrc" 2>/dev/null || echo "alias anime='$S anim 5'" >> "$HOME/.bashrc"
+
+# ------------------------------------------------------------
+# 8) TIMER : animation toutes les 10 min + overlay au démarrage
+# ------------------------------------------------------------
+cat > "$HOME/.config/systemd/user/nexus-cinema.service" <<EOF
+[Unit]
+Description=Nexus Cinema Anim
+[Service]
+Type=oneshot
+ExecStart=$S vivant
+Environment=DISPLAY=:0
+EOF
+
+cat > "$HOME/.config/systemd/user/nexus-cinema.timer" <<EOF
+[Unit]
+Description=Nexus Cinema Anim 10min
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=10min
+Unit=nexus-cinema.service
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload 2>/dev/null || true
+systemctl --user enable --now nexus-cinema.timer 2>/dev/null \
+  && echo "  ✓ Timer anim actif (10 min)" \
+  || echo "  ⚠ Timer inactif"
+
+# ------------------------------------------------------------
+# 9) AUTOSTART OVERLAY
+# ------------------------------------------------------------
+cat > "$HOME/.config/autostart/nexus-overlay.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Nexus Overlay
+Exec=$OVERLAY start
+X-GNOME-Autostart-enabled=true
+EOF
+
+# ------------------------------------------------------------
+# 10) APPLICATION IMMÉDIATE
+# ------------------------------------------------------------
+echo ""
+echo "▸ Premier effet vivant..."
+bash "$ANIM" 1
+bash "$OVERLAY" start || true
+
+# ------------------------------------------------------------
+# 11) BILAN
+# ------------------------------------------------------------
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║       ✓ NEXUS ANIM — BUREAU VIVANT ET RÉACTIF                ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+echo "  12 galaxies × 8 frames = 96 images animées"
+echo "  Overlay conky : $([ "$HAS_CONKY" = "1" ] && echo 'ACTIF' || echo 'inactif (installe conky-all)')"
+echo ""
+echo "  Commandes :"
+echo "    vivant         → animation + overlay (le combo complet)"
+echo "    anime          → 5 cycles d'animation rapide"
+echo "    nexus anim 10  → 10 cycles"
+echo "    nexus overlay start|stop"
+echo "    nexus frames   → nombre de frames par galaxie"
+echo ""
