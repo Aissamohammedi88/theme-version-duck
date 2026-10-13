@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+NEXUS ULTRACONNECT PRO
+Dashboard ingénieur technique avec graphiques vivants interactifs
+Auteur : Aissa Mohammedi (DGK)
+Port : 9700
+Zéro dépendance externe (Python + JS Canvas pur)
+"""
+import os
+import sys
+import json
+import math
+import time
+import random
+import socket
+import platform
+import threading
+import http.server
+import socketserver
+from pathlib import Path
+from datetime import datetime
+from collections import deque
+
+PORT = int(os.environ.get("PORT", 9700))
+HOST = "0.0.0.0"
+
+G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; B = "\033[94m"; C = "\033[96m"; M = "\033[95m"; N = "\033[0m"
+
+def ok(m): print(G + "[OK] " + N + m)
+def info(m): print(B + "[i] " + N + m)
+def err(m): print(R + "[KO] " + N + m)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYSTEM METRICS
+# ══════════════════════════════════════════════════════════════════════════════
+class SystemMetrics:
+
+MAX_HISTORY = 300
+
+def __init__(self):
+self.history = {
+"cpu": deque(maxlen=self.MAX_HISTORY),
+"ram": deque(maxlen=self.MAX_HISTORY),
+"disk": deque(maxlen=self.MAX_HISTORY),
+"net_in": deque(maxlen=self.MAX_HISTORY),
+"net_out": deque(maxlen=self.MAX_HISTORY),
+"temp": deque(maxlen=self.MAX_HISTORY),
+"timestamps": deque(maxlen=self.MAX_HISTORY),
+}
+self.last_net = self._net_stats()
+self.last_net_time = time.time()
+self.lock = threading.Lock()
+self._last_cpu = None
+
+def _read(self, path):
+try:
+return Path(path).read_text().strip()
+except Exception:
+return ""
+
+def _net_stats(self):
+stats = {"rx": 0, "tx": 0}
+try:
+for line in self._read("/proc/net/dev").split("\n")[2:]:
+if ":" not in line:
+continue
+iface, data = line.split(":", 1)
+if iface.strip() == "lo":
+continue
+parts = data.split()
+if len(parts) >= 9:
+stats["rx"] += int(parts[0])
+stats["tx"] += int(parts[8])
+except Exception:
+pass
+return stats
+
+def cpu_usage(self):
+try:
+with open("/proc/stat") as f:
+line = f.readline()
+values = [int(x) for x in line.split()[1:]]
+idle = values[3]
+total = sum(values)
+if self._last_cpu is None:
+self._last_cpu = (idle, total)
+return 0
+last_idle, last_total = self._last_cpu
+delta_idle = idle - last_idle
+delta_total = total - last_total
+self._last_cpu = (idle, total)
+if delta_total == 0:
+return 0
+return round(100 * (1 - delta_idle / delta_total), 1)
+except Exception:
+return 0
+
+def ram_usage(self):
+try:
+info_d = {}
+for line in self._read("/proc/meminfo").split("\n"):
+if ":" in line:
+k, v = line.split(":", 1)
+info_d[k.strip()] = v.strip()
+total = int(info_d.get("MemTotal", "0").split()[0])
+available = int(info_d.get("MemAvailable", "0").split()[0])
+if total == 0:
+return 0, 0, 0
+used = total - available
+return round(100 * used / total, 1), round(used / 1024 / 1024, 2), round(total / 1024 / 1024, 2)
+except Exception:
+return 0, 0, 0
+
+def disk_usage(self):
+try:
+import shutil
+total, used, free = shutil.disk_usage("/")
+return round(100 * used / total, 1), round(used / 1024**3, 2), round(total / 1024**3, 2)
+except Exception:
+return 0, 0, 0
+
+def network_rate(self):
+now = time.time()
+current = self._net_stats()
+dt = now - self.last_net_time
+if dt < 0.5:
+return 0, 0
+rx = (current["rx"] - self.last_net["rx"]) / dt
+tx = (current["tx"] - self.last_net["tx"]) / dt
+self.last_net = current
+self.last_net_time = now
+return round(rx / 1024, 1), round(tx / 1024, 1)
+
+def temperature(self):
+try:
+for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+f = zone / "temp"
+if f.exists():
+return round(int(f.read_text().strip()) / 1000, 1)
+except Exception:
+pass
+return 0
+
+def collect(self):
+with self.lock:
+cpu = self.cpu_usage()
+ram_pct, ram_used, ram_total = self.ram_usage()
+disk_pct, disk_used, disk_total = self.disk_usage()
+net_in, net_out = self.network_rate()
+temp = self.temperature()
+
+ts = datetime.now().isoformat()
+self.history["cpu"].append(cpu)
+self.history["ram"].append(ram_pct)
+self.history["disk"].append(disk_pct)
+self.history["net_in"].append(net_in)
+self.history["net_out"].append(net_out)
+self.history["temp"].append(temp)
+self.history["timestamps"].append(ts)
+
+return {
+"cpu": cpu,
+"ram_pct": ram_pct,
+"ram_used_gb": ram_used,
+"ram_total_gb": ram_total,
+"disk_pct": disk_pct,
+"disk_used_gb": disk_used,
+"disk_total_gb": disk_total,
+"net_in_kbs": net_in,
+"net_out_kbs": net_out,
+"temp_c": temp,
+"timestamp": ts,
+"history": {
+"cpu": list(self.history["cpu"]),
+"ram": list(self.history["ram"]),
+"disk": list(self.history["disk"]),
+"net_in": list(self.history["net_in"]),
+"net_out": list(self.history["net_out"]),
+"temp": list(self.history["temp"]),
+"timestamps": list(self.history["timestamps"]),
+},
+}
+
+def system_info(self):
+try:
+uptime = float(self._read("/proc/uptime").split()[0])
+days = int(uptime // 86400)
+hours = int((uptime % 86400) // 3600)
+mins = int((uptime % 3600) // 60)
+secs = int(uptime % 60)
+if days > 0:
+uptime_str = str(days) + "d " + str(hours) + "h " + str(mins) + "m"
+elif hours > 0:
+uptime_str = str(hours) + "h " + str(mins) + "m"
+else:
+uptime_str = str(mins) + "m " + str(secs) + "s"
+boot = datetime.fromtimestamp(time.time() - uptime).strftime("%Y-%m-%d %H:%M:%S")
+except Exception:
+uptime_str = "?"
+boot = "?"
+
+return {
+"hostname": socket.gethostname(),
+"platform": platform.system(),
+"platform_release": platform.release(),
+"architecture": platform.machine(),
+"processor": platform.processor() or "N/A",
+"python_version": sys.version.split()[0],
+"cpu_count": os.cpu_count() or 1,
+"boot_time": boot,
+"uptime": uptime_str,
+}
+
+
+METRICS = SystemMetrics()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML + CSS + JS (graphiques vivants interactifs)
+# ══════════════════════════════════════════════════════════════════════════════
+PAGE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEXUS ULTRACONNECT PRO</title>
+<style>
+:root{
+--bg:#050810;--card:#0d1424;--border:#1a3a5c;
+--gold:#c8a45c;--cyan:#00d4ff;--pink:#ff6ec7;--green:#00ff9d;
+--yellow:#fbbf24;--red:#ff2d55;--text:#c8e8ff;--dim:#4a6b8a;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;min-height:100%;background:var(--bg);color:var(--text);
+font-family:'SF Mono','Monaco','Menlo',monospace;overflow-x:hidden}
+body::before{content:"";position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;
+z-index:9999;background:repeating-linear-gradient(0deg,
+rgba(0,212,255,0.02) 0px,rgba(0,212,255,0.02) 1px,transparent 1px,transparent 3px)}
+.grid-bg{position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:0;
+background-image:linear-gradient(rgba(0,212,255,0.05) 1px,transparent 1px),
+linear-gradient(90deg,rgba(0,212,255,0.05) 1px,transparent 1px);
+background-size:40px 40px;animation:gridScroll 20s linear infinite}
+@keyframes gridScroll{from{background-position:0 0}to{background-position:40px 40px}}
+.container{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px}
+
+.header{display:flex;justify-content:space-between;align-items:center;padding:20px 24px;
+background:linear-gradient(135deg,rgba(13,20,36,0.9),rgba(5,8,16,0.9));
+border:1px solid var(--border);border-radius:12px;margin-bottom:20px;
+position:relative;overflow:hidden;backdrop-filter:blur(10px)}
+.header::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;
+background:linear-gradient(90deg,transparent,var(--cyan),transparent);
+animation:headerScan 3s linear infinite}
+@keyframes headerScan{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+.logo{font-size:24px;font-weight:900;letter-spacing:-1px;
+background:linear-gradient(135deg,#fff,var(--gold) 50%,var(--cyan));
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;
+animation:logoGlow 4s ease-in-out infinite}
+@keyframes logoGlow{0%,100%{filter:drop-shadow(0 0 8px rgba(0,212,255,0.4))}
+50%{filter:drop-shadow(0 0 16px rgba(0,212,255,0.8))}}
+.logo .version{font-size:10px;color:var(--dim);letter-spacing:3px;display:block;
+margin-top:4px;-webkit-text-fill-color:var(--dim)}
+.header-status{display:flex;gap:16px;align-items:center}
+.status-pill{display:flex;align-items:center;gap:8px;padding:8px 14px;
+background:rgba(0,255,157,0.05);border:1px solid rgba(0,255,157,0.3);
+border-radius:999px;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;
+color:var(--green)}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);
+box-shadow:0 0 10px var(--green);animation:dotPulse 1.5s infinite}
+@keyframes dotPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(1.3)}}
+.clock{font-size:20px;font-weight:700;color:var(--cyan);
+text-shadow:0 0 10px var(--cyan);letter-spacing:2px}
+
+.section-title{display:flex;align-items:center;gap:12px;margin:24px 0 14px;
+font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--dim);font-weight:700}
+.section-title::before{content:"";width:4px;height:14px;background:var(--cyan);
+box-shadow:0 0 8px var(--cyan)}
+.section-title::after{content:"";flex:1;height:1px;
+background:linear-gradient(90deg,var(--border),transparent)}
+
+.metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+gap:16px;margin-bottom:20px}
+.metric-card{background:linear-gradient(135deg,rgba(13,20,36,0.9),rgba(5,8,16,0.95));
+border:1px solid var(--border);border-radius:12px;padding:20px;position:relative;
+overflow:hidden;transition:all 0.3s;backdrop-filter:blur(10px)}
+.metric-card:hover{border-color:var(--cyan);transform:translateY(-2px);
+box-shadow:0 8px 32px rgba(0,212,255,0.15)}
+.metric-card::before{content:"";position:absolute;top:0;left:0;width:4px;height:100%;
+background:var(--cyan);box-shadow:0 0 12px var(--cyan)}
+.metric-card.warning::before{background:var(--yellow);box-shadow:0 0 12px var(--yellow)}
+.metric-card.critical::before{background:var(--red);box-shadow:0 0 12px var(--red);
+animation:criticalPulse 0.6s infinite}
+@keyframes criticalPulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.metric-label{font-size:10px;color:var(--dim);text-transform:uppercase;
+letter-spacing:2px;margin-bottom:10px;display:flex;justify-content:space-between}
+.metric-label .icon{font-size:14px}
+.metric-value{font-size:42px;font-weight:900;line-height:1;letter-spacing:-2px;
+margin-bottom:6px;font-variant-numeric:tabular-nums}
+.metric-value.cyan{color:var(--cyan);text-shadow:0 0 20px rgba(0,212,255,0.5)}
+.metric-value.gold{color:var(--gold);text-shadow:0 0 20px rgba(200,164,92,0.5)}
+.metric-value.green{color:var(--green);text-shadow:0 0 20px rgba(0,255,157,0.5)}
+.metric-value.yellow{color:var(--yellow);text-shadow:0 0 20px rgba(251,191,36,0.5)}
+.metric-unit{font-size:16px;color:var(--dim);margin-left:4px}
+.metric-sub{font-size:11px;color:var(--dim);font-family:monospace;margin-top:4px}
+
+.progress-bar{height:6px;background:rgba(0,0,0,0.5);border-radius:3px;
+overflow:hidden;margin-top:12px}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--cyan),var(--green));
+border-radius:3px;transition:width 0.5s ease;
+box-shadow:0 0 10px rgba(0,212,255,0.6)}
+.progress-fill.warning{background:linear-gradient(90deg,var(--yellow),var(--gold))}
+.progress-fill.critical{background:linear-gradient(90deg,var(--red),var(--pink))}
+
+.chart-panel{background:linear-gradient(135deg,rgba(13,20,36,0.9),rgba(5,8,16,0.95));
+border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:20px;
+backdrop-filter:blur(10px)}
+.chart-header{display:flex;justify-content:space-between;align-items:center;
+margin-bottom:16px;flex-wrap:wrap;gap:12px}
+.chart-title{font-size:11px;color:var(--dim);letter-spacing:3px;text-transform:uppercase}
+.chart-controls{display:flex;gap:8px;align-items:center}
+.ctrl-btn{background:rgba(13,20,36,0.9);border:1px solid var(--border);
+color:var(--cyan);padding:6px 12px;border-radius:6px;cursor:pointer;
+font-size:11px;font-family:monospace;transition:all 0.2s}
+.ctrl-btn:hover{border-color:var(--cyan);background:rgba(0,212,255,0.1)}
+.ctrl-btn.active{background:var(--cyan);color:#000;border-color:var(--cyan)}
+.legend{display:flex;gap:16px;font-size:10px;flex-wrap:wrap}
+.legend-item{display:flex;align-items:center;gap:6px;cursor:pointer;
+padding:4px 8px;border-radius:4px;transition:all 0.2s;user-select:none}
+.legend-item:hover{background:rgba(255,255,255,0.05)}
+.legend-item.disabled{opacity:0.3}
+.legend-dot{width:10px;height:10px;border-radius:2px;box-shadow:0 0 8px currentColor}
+
+canvas{display:block;width:100%;touch-action:none}
+#main-canvas{cursor:crosshair;border-radius:8px;background:rgba(0,0,0,0.3)}
+#main-canvas.zoomed{cursor:zoom-out}
+
+.tooltip{position:fixed;background:rgba(13,20,36,0.98);border:1px solid var(--cyan);
+border-radius:6px;padding:10px 14px;font-size:11px;font-family:monospace;
+pointer-events:none;z-index:10000;box-shadow:0 8px 32px rgba(0,212,255,0.3);
+display:none;white-space:nowrap}
+.tooltip .tt-time{color:var(--dim);font-size:10px;margin-bottom:6px;
+border-bottom:1px solid var(--border);padding-bottom:4px}
+.tooltip .tt-row{display:flex;justify-content:space-between;gap:12px;margin-top:3px}
+.tooltip .tt-label{color:var(--dim)}
+.tooltip .tt-value{color:var(--cyan);font-weight:700}
+
+.info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.info-item{padding:12px;background:rgba(0,0,0,0.3);border:1px solid var(--border);
+border-radius:8px}
+.info-key{font-size:9px;color:var(--dim);text-transform:uppercase;
+letter-spacing:1.5px;margin-bottom:6px}
+.info-val{font-size:12px;color:var(--cyan);word-break:break-all;font-family:monospace}
+
+.footer{text-align:center;margin-top:40px;padding:24px;color:var(--dim);
+font-size:10px;letter-spacing:2px;text-transform:uppercase;
+border-top:1px solid var(--border)}
+.footer .author{color:var(--gold)}
+.footer .dot{color:var(--cyan);margin:0 8px}
+
+#loading{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);
+display:flex;align-items:center;justify-content:center;flex-direction:column;
+gap:20px;z-index:99999;transition:opacity 0.5s}
+#loading.hide{opacity:0;pointer-events:none}
+.loader-ring{width:80px;height:80px;border-radius:50%;border:2px solid var(--border);
+border-top-color:var(--cyan);border-right-color:var(--gold);
+animation:spin 1s linear infinite;position:relative}
+.loader-ring::after{content:"";position:absolute;top:10px;left:10px;right:10px;
+bottom:10px;border-radius:50%;border:2px solid transparent;
+border-bottom-color:var(--pink);animation:spin 1.5s linear infinite reverse}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loader-text{color:var(--cyan);font-size:12px;letter-spacing:4px;
+text-transform:uppercase;animation:fadeText 2s ease-in-out infinite}
+@keyframes fadeText{0%,100%{opacity:0.5}50%{opacity:1}}
+
+@media(max-width:640px){
+.container{padding:12px}
+.header{padding:16px;flex-direction:column;gap:12px;align-items:flex-start}
+.header-status{width:100%;justify-content:space-between}
+.metric-value{font-size:32px}
+.clock{font-size:16px}
+.logo{font-size:18px}
+}
+</style>
+</head>
+<body>
+
+<div id="loading">
+<div class="loader-ring"></div>
+<div class="loader-text">Initialisation UltraConnect...</div>
+</div>
+
+<div class="grid-bg"></div>
+
+<div class="container">
+
+<div class="header">
+<div>
+<div class="logo">NEXUS ULTRACONNECT PRO
+<span class="version">v2.0.0 // INTERACTIVE ENGINEER DASHBOARD</span>
+</div>
+</div>
+<div class="header-status">
+<div class="status-pill">
+<span class="status-dot"></span>
+<span>SYSTEME OPERATIONNEL</span>
+</div>
+<div class="clock" id="clock">--:--:--</div>
+</div>
+</div>
+
+<div class="section-title">Metriques Temps Reel</div>
+
+<div class="metrics-grid">
+<div class="metric-card" id="card-cpu">
+<div class="metric-label"><span>CPU USAGE</span><span class="icon">⚡</span></div>
+<div class="metric-value cyan"><span id="cpu-val">0</span><span class="metric-unit">%</span></div>
+<div class="metric-sub" id="cpu-sub">Chargement...</div>
+<div class="progress-bar"><div class="progress-fill" id="cpu-bar" style="width:0%"></div></div>
+</div>
+
+<div class="metric-card" id="card-ram">
+<div class="metric-label"><span>MEMOIRE RAM</span><span class="icon">🧠</span></div>
+<div class="metric-value gold"><span id="ram-val">0</span><span class="metric-unit">%</span></div>
+<div class="metric-sub" id="ram-sub">Chargement...</div>
+<div class="progress-bar"><div class="progress-fill" id="ram-bar" style="width:0%"></div></div>
+</div>
+
+<div class="metric-card" id="card-disk">
+<div class="metric-label"><span>DISQUE</span><span class="icon">💾</span></div>
+<div class="metric-value green"><span id="disk-val">0</span><span class="metric-unit">%</span></div>
+<div class="metric-sub" id="disk-sub">Chargement...</div>
+<div class="progress-bar"><div class="progress-fill" id="disk-bar" style="width:0%"></div></div>
+</div>
+
+<div class="metric-card" id="card-net">
+<div class="metric-label"><span>RESEAU</span><span class="icon">📡</span></div>
+<div class="metric-value cyan"><span id="net-in">0</span><span class="metric-unit">KB/s</span></div>
+<div class="metric-sub">↓ <span id="net-in-v">0</span> · ↑ <span id="net-out-v">0</span> KB/s</div>
+</div>
+
+<div class="metric-card" id="card-temp">
+<div class="metric-label"><span>TEMPERATURE</span><span class="icon">🌡️</span></div>
+<div class="metric-value yellow"><span id="temp-val">--</span><span class="metric-unit">°C</span></div>
+<div class="metric-sub" id="temp-sub">Capteur</div>
+</div>
+
+<div class="metric-card">
+<div class="metric-label"><span>UPTIME</span><span class="icon">⏱️</span></div>
+<div class="metric-value green" id="uptime-val" style="font-size:24px">--</div>
+<div class="metric-sub" id="boot-time">Boot: --</div>
+</div>
+</div>
+
+<div class="section-title">Graphique Interactif</div>
+
+<div class="chart-panel">
+<div class="chart-header">
+<div class="chart-title">
+<span id="chart-info">60 points · 1s d'intervalle</span>
+</div>
+<div class="chart-controls">
+<button class="ctrl-btn" id="btn-zoom" onclick="toggleZoom()">🔍 Zoom</button>
+<button class="ctrl-btn active" id="btn-play" onclick="togglePlay()">⏸ Pause</button>
+<button class="ctrl-btn" onclick="resetView()">↻ Reset</button>
+<button class="ctrl-btn" onclick="exportData()">💾 Export</button>
+</div>
+</div>
+<div class="legend" id="legend">
+<div class="legend-item" data-series="cpu" onclick="toggleSeries('cpu')">
+<span class="legend-dot" style="background:#00d4ff;color:#00d4ff"></span>CPU
+</div>
+<div class="legend-item" data-series="ram" onclick="toggleSeries('ram')">
+<span class="legend-dot" style="background:#c8a45c;color:#c8a45c"></span>RAM
+</div>
+<div class="legend-item" data-series="disk" onclick="toggleSeries('disk')">
+<span class="legend-dot" style="background:#00ff9d;color:#00ff9d"></span>Disk
+</div>
+<div class="legend-item" data-series="net_in" onclick="toggleSeries('net_in')">
+<span class="legend-dot" style="background:#ff6ec7;color:#ff6ec7"></span>Net ↓
+</div>
+<div class="legend-item" data-series="net_out" onclick="toggleSeries('net_out')">
+<span class="legend-dot" style="background:#fbbf24;color:#fbbf24"></span>Net ↑
+</div>
+<div class="legend-item" data-series="temp" onclick="toggleSeries('temp')">
+<span class="legend-dot" style="background:#ff2d55;color:#ff2d55"></span>Temp
+</div>
+</div>
+<canvas id="main-canvas" width="1400" height="400"></canvas>
+</div>
+
+<div class="section-title">Informations Systeme</div>
+<div class="info-grid" id="info-grid"></div>
+
+<div class="footer">
+NEXUS ULTRACONNECT PRO <span class="dot">·</span>
+BUILT BY <span class="author">AISSA MOHAMMEDI (DGK)</span>
+<span class="dot">·</span>
+<span id="year"></span>
+</div>
+
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════
+var STATE = {
+history: { cpu: [], ram: [], disk: [], net_in: [], net_out: [], temp: [], timestamps: [] },
+visible: { cpu: true, ram: true, disk: true, net_in: true, net_out: true, temp: true },
+paused: false,
+zoom: false,
+zoomRange: null,
+hoverX: null,
+maxPoints: 60,
+colors: {
+cpu: '#00d4ff', ram: '#c8a45c', disk: '#00ff9d',
+net_in: '#ff6ec7', net_out: '#fbbf24', temp: '#ff2d55'
+}
+};
+
+// ═══════════════════════════════════════════════════════════
+// CLOCK
+// ═══════════════════════════════════════════════════════════
+function tickClock(){
+var d = new Date();
+var hh = String(d.getHours()).padStart(2,'0');
+var mm = String(d.getMinutes()).padStart(2,'0');
+var ss = String(d.getSeconds()).padStart(2,'0');
+document.getElementById('clock').textContent = hh+':'+mm+':'+ss;
+}
+setInterval(tickClock, 1000); tickClock();
+document.getElementById('year').textContent = new Date().getFullYear();
+
+// ═══════════════════════════════════════════════════════════
+// CANVAS SETUP
+// ═══════════════════════════════════════════════════════════
+var canvas = document.getElementById('main-canvas');
+var ctx = canvas.getContext('2d');
+var dpr = window.devicePixelRatio || 1;
+
+function resizeCanvas(){
+var rect = canvas.getBoundingClientRect();
+canvas.width = rect.width * dpr;
+canvas.height = rect.height * dpr;
+ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+setTimeout(resizeCanvas, 100);
+window.addEventListener('resize', function(){ resizeCanvas(); drawChart(); });
+
+// ═══════════════════════════════════════════════════════════
+// DRAW CHART
+// ═══════════════════════════════════════════════════════════
+function drawChart(){
+var rect = canvas.getBoundingClientRect();
+var W = rect.width, H = rect.height;
+var pad = { l: 60, r: 20, t: 20, b: 40 };
+var cw = W - pad.l - pad.r;
+var ch = H - pad.t - pad.b;
+
+ctx.clearRect(0, 0, W, H);
+
+// Background grid
+ctx.strokeStyle = 'rgba(26,58,92,0.4)';
+ctx.lineWidth = 1;
+for (var i = 0; i <= 5; i++){
+var y = pad.t + ch * i / 5;
+ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + cw, y); ctx.stroke();
+}
+for (var i = 0; i <= 10; i++){
+var x = pad.l + cw * i / 10;
+ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ch); ctx.stroke();
+}
+
+// Y labels
+ctx.fillStyle = '#4a6b8a';
+ctx.font = '10px monospace';
+ctx.textAlign = 'right';
+ctx.textBaseline = 'middle';
+for (var i = 0; i <= 5; i++){
+var y = pad.t + ch * i / 5;
+ctx.fillText(Math.round(100 * (5 - i) / 5) + '%', pad.l - 8, y);
+}
+
+// Data
+var data = STATE.history;
+if (!data.cpu || data.cpu.length < 2) return;
+
+var points = Math.min(STATE.maxPoints, data.cpu.length);
+var start = data.cpu.length - points;
+
+// Compute dynamic max
+var maxVal = 100;
+var netMax = Math.max.apply(null, data.net_in.slice(start).concat([1]));
+var tempMax = 120;
+
+var stepX = cw / (points - 1);
+
+// X labels (temps)
+ctx.textAlign = 'center';
+ctx.textBaseline = 'top';
+for (var i = 0; i <= 5; i++){
+var idx = start + Math.floor(points * i / 5);
+idx = Math.min(idx, data.timestamps.length - 1);
+var ts = data.timestamps[idx] || '';
+var timeStr = ts.slice(11, 19);
+var x = pad.l + cw * i / 5;
+ctx.fillText(timeStr, x, pad.t + ch + 8);
+}
+
+// Draw each series
+var series = ['cpu', 'ram', 'disk', 'net_in', 'net_out', 'temp'];
+series.forEach(function(key){
+if (!STATE.visible[key]) return;
+var values = data[key].slice(start);
+var color = STATE.colors[key];
+var scale = 100;
+if (key === 'net_in' || key === 'net_out') scale = Math.max(netMax, 10);
+else if (key === 'temp') scale = tempMax;
+
+// Area fill
+ctx.beginPath();
+ctx.moveTo(pad.l, pad.t + ch);
+for (var i = 0; i < values.length; i++){
+var x = pad.l + i * stepX;
+var v = Math.min(values[i] || 0, scale);
+var y = pad.t + ch - (v / scale) * ch;
+ctx.lineTo(x, y);
+}
+ctx.lineTo(pad.l + cw, pad.t + ch);
+ctx.closePath();
+var grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + ch);
+grad.addColorStop(0, color + '40');
+grad.addColorStop(1, color + '00');
+ctx.fillStyle = grad;
+ctx.fill();
+
+// Line
+ctx.beginPath();
+ctx.strokeStyle = color;
+ctx.lineWidth = 2;
+ctx.shadowBlur = 8;
+ctx.shadowColor = color;
+for (var i = 0; i < values.length; i++){
+var x = pad.l + i * stepX;
+var v = Math.min(values[i] || 0, scale);
+var y = pad.t + ch - (v / scale) * ch;
+if (i === 0) ctx.moveTo(x, y);
+else ctx.lineTo(x, y);
+}
+ctx.stroke();
+ctx.shadowBlur = 0;
+
+// Last value dot
+if (values.length > 0){
+var lastX = pad.l + (values.length - 1) * stepX;
+var lastY = pad.t + ch - (Math.min(values[values.length-1], scale) / scale) * ch;
+ctx.beginPath();
+ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
+ctx.fillStyle = color;
+ctx.shadowBlur = 12;
+ctx.shadowColor = color;
+ctx.fill();
+ctx.shadowBlur = 0;
+}
+});
+
+// Hover line
+if (STATE.hoverX !== null && STATE.hoverX >= pad.l && STATE.hoverX <= pad.l + cw){
+ctx.strokeStyle = 'rgba(0,212,255,0.5)';
+ctx.lineWidth = 1;
+ctx.setLineDash([4, 4]);
+ctx.beginPath();
+ctx.moveTo(STATE.hoverX, pad.t);
+ctx.lineTo(STATE.hoverX, pad.t + ch);
+ctx.stroke();
+ctx.setLineDash([]);
+}
+}
+
+// ═══════════════════════════════════════════════════════════
+// INTERACTION
+// ═══════════════════════════════════════════════════════════
+canvas.addEventListener('mousemove', function(e){
+var rect = canvas.getBoundingClientRect();
+var mouseX = e.clientX - rect.left;
+var pad = { l: 60, r: 20 };
+var cw = rect.width - pad.l - pad.r;
+var data = STATE.history;
+if (!data.cpu || data.cpu.length < 2){ return; }
+
+var points = Math.min(STATE.maxPoints, data.cpu.length);
+var start = data.cpu.length - points;
+var stepX = cw / (points - 1);
+
+if (mouseX >= pad.l && mouseX <= pad.l + cw){
+STATE.hoverX = mouseX;
+var idx = Math.round((mouseX - pad.l) / stepX);
+idx = Math.max(0, Math.min(idx, points - 1));
+var dataIdx = start + idx;
+
+showTooltip(e.clientX, e.clientY, dataIdx);
+} else {
+STATE.hoverX = null;
+hideTooltip();
+}
+drawChart();
+});
+
+canvas.addEventListener('mouseleave', function(){
+STATE.hoverX = null;
+hideTooltip();
+drawChart();
+});
+
+function showTooltip(mouseX, mouseY, idx){
+var tt = document.getElementById('tooltip');
+var data = STATE.history;
+var ts = (data.timestamps[idx] || '').slice(11, 19);
+var html = '<div class="tt-time">⏱ ' + ts + '</div>';
+var series = ['cpu', 'ram', 'disk', 'net_in', 'net_out', 'temp'];
+var labels = { cpu: 'CPU', ram: 'RAM', disk: 'Disk', net_in: 'Net ↓', net_out: 'Net ↑', temp: 'Temp' };
+series.forEach(function(key){
+if (!STATE.visible[key]) return;
+var v = data[key][idx] || 0;
+var unit = (key === 'net_in' || key === 'net_out') ? ' KB/s' : (key === 'temp' ? ' °C' : ' %');
+html += '<div class="tt-row"><span class="tt-label" style="color:' + STATE.colors[key] + '">' + labels[key] + '</span><span class="tt-value">' + v + unit + '</span></div>';
+});
+tt.innerHTML = html;
+tt.style.display = 'block';
+var tw = tt.offsetWidth;
+var th = tt.offsetHeight;
+var x = mouseX + 15;
+var y = mouseY + 15;
+if (x + tw > window.innerWidth) x = mouseX - tw - 15;
+if (y + th > window.innerHeight) y = mouseY - th - 15;
+tt.style.left = x + 'px';
+tt.style.top = y + 'px';
+}
+
+function hideTooltip(){
+document.getElementById('tooltip').style.display = 'none';
+}
+
+// ═══════════════════════════════════════════════════════════
+// CONTROLS
+// ═══════════════════════════════════════════════════════════
+function togglePlay(){
+STATE.paused = !STATE.paused;
+var btn = document.getElementById('btn-play');
+btn.textContent = STATE.paused ? '▶ Lecture' : '⏸ Pause';
+btn.classList.toggle('active', !STATE.paused);
+}
+
+function toggleZoom(){
+STATE.zoom = !STATE.zoom;
+STATE.maxPoints = STATE.zoom ? 30 : 60;
+document.getElementById('btn-zoom').classList.toggle('active', STATE.zoom);
+document.getElementById('chart-info').textContent = STATE.maxPoints + ' points · 1s d\'intervalle';
+drawChart();
+}
+
+function resetView(){
+STATE.zoom = false;
+STATE.maxPoints = 60;
+STATE.hoverX = null;
+STATE.visible = { cpu: true, ram: true, disk: true, net_in: true, net_out: true, temp: true };
+document.querySelectorAll('.legend-item').forEach(function(el){
+el.classList.remove('disabled');
+});
+document.getElementById('btn-zoom').classList.remove('active');
+document.getElementById('chart-info').textContent = '60 points · 1s d\'intervalle';
+hideTooltip();
+drawChart();
+}
+
+function toggleSeries(key){
+STATE.visible[key] = !STATE.visible[key];
+var el = document.querySelector('[data-series="' + key + '"]');
+if (el) el.classList.toggle('disabled', !STATE.visible[key]);
+drawChart();
+}
+
+function exportData(){
+var data = JSON.stringify(STATE.history, null, 2);
+var blob = new Blob([data], { type: 'application/json' });
+var url = URL.createObjectURL(blob);
+var a = document.createElement('a');
+a.href = url;
+a.download = 'nexus_metrics_' + Date.now() + '.json';
+a.click();
+URL.revokeObjectURL(url);
+}
+
+// ═══════════════════════════════════════════════════════════
+// UPDATE UI
+// ═══════════════════════════════════════════════════════════
+function setValueClass(id, value){
+var el = document.getElementById(id);
+var cls = 'metric-value';
+if (value > 80) cls += ' red';
+else if (value > 60) cls += ' yellow';
+else cls += ' cyan';
+el.className = cls;
+}
+
+function updateUI(d){
+// CPU
+document.getElementById('cpu-val').textContent = Math.round(d.cpu);
+document.getElementById('cpu-sub').textContent = d.cpu > 80 ? '⚠ Charge elevee' : (d.cpu > 60 ? 'Modere' : 'Normal');
+var cb = document.getElementById('cpu-bar');
+cb.style.width = d.cpu + '%';
+cb.className = 'progress-fill' + (d.cpu > 80 ? ' critical' : d.cpu > 60 ? ' warning' : '');
+document.getElementById('card-cpu').className = 'metric-card' + (d.cpu > 80 ? ' critical' : d.cpu > 60 ? ' warning' : '');
+
+// RAM
+document.getElementById('ram-val').textContent = d.ram_pct;
+document.getElementById('ram-sub').textContent = d.ram_used_gb + ' / ' + d.ram_total_gb + ' GB';
+var rb = document.getElementById('ram-bar');
+rb.style.width = d.ram_pct + '%';
+rb.className = 'progress-fill' + (d.ram_pct > 80 ? ' critical' : d.ram_pct > 60 ? ' warning' : '');
+document.getElementById('card-ram').className = 'metric-card' + (d.ram_pct > 80 ? ' critical' : d.ram_pct > 60 ? ' warning' : '');
+
+// Disk
+document.getElementById('disk-val').textContent = d.disk_pct;
+document.getElementById('disk-sub').textContent = d.disk_used_gb + ' / ' + d.disk_total_gb + ' GB';
+var db = document.getElementById('disk-bar');
+db.style.width = d.disk_pct + '%';
+db.className = 'progress-fill' + (d.disk_pct > 90 ? ' critical' : d.disk_pct > 75 ? ' warning' : '');
+document.getElementById('card-disk').className = 'metric-card' + (d.disk_pct > 90 ? ' critical' : d.disk_pct > 75 ? ' warning' : '');
+
+// Net
+document.getElementById('net-in').textContent = d.net_in_kbs;
+document.getElementById('net-in-v').textContent = d.net_in_kbs;
+document.getElementById('net-out-v').textContent = d.net_out_kbs;
+
+// Temp
+if (d.temp_c > 0){
+document.getElementById('temp-val').textContent = d.temp_c;
+document.getElementById('temp-sub').textContent = d.temp_c > 80 ? '⚠ Critique' : (d.temp_c > 60 ? 'Chaud' : 'Normal');
+}
+
+// Update history
+STATE.history = d.history;
+drawChart();
+}
+
+function renderInfo(info){
+var grid = document.getElementById('info-grid');
+var items = [
+['HOSTNAME', info.hostname],
+['PLATEFORME', info.platform + ' ' + info.platform_release],
+['ARCHITECTURE', info.architecture],
+['PROCESSEUR', info.processor || 'N/A'],
+['PYTHON', info.python_version],
+['CPU COUNT', info.cpu_count + ' coeurs'],
+['BOOT TIME', info.boot_time],
+['UPTIME', info.uptime],
+];
+var html = '';
+items.forEach(function(it){
+html += '<div class="info-item"><div class="info-key">' + it[0] + '</div><div class="info-val">' + it[1] + '</div></div>';
+});
+grid.innerHTML = html;
+document.getElementById('uptime-val').textContent = info.uptime;
+document.getElementById('boot-time').textContent = 'Boot: ' + info.boot_time;
+}
+
+// ═══════════════════════════════════════════════════════════
+// POLLING
+// ═══════════════════════════════════════════════════════════
+async function poll(){
+if (STATE.paused) return;
+try{
+var r = await fetch('/api/metrics');
+var d = await r.json();
+updateUI(d);
+}catch(e){}
+}
+
+async function loadInfo(){
+try{
+var r = await fetch('/api/info');
+var info = await r.json();
+renderInfo(info);
+}catch(e){}
+}
+
+setTimeout(function(){
+document.getElementById('loading').classList.add('hide');
+resizeCanvas();
+}, 1200);
+
+loadInfo();
+poll();
+setInterval(poll, 1000);
+setInterval(loadInfo, 30000);
+</script>
+</body>
+</html>
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+class Handler(http.server.BaseHTTPRequestHandler):
+
+def log_message(self, *a):
+pass
+
+def _send(self, code, body, ctype="text/html; charset=utf-8"):
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def do_GET(self):
+import urllib.parse
+p = urllib.parse.urlparse(self.path)
+path = p.path
+
+if path in ("/", "/index.html"):
+self._send(200, PAGE)
+elif path == "/api/metrics":
+self._send(200, json.dumps(METRICS.collect()), "application/json; charset=utf-8")
+elif path == "/api/info":
+self._send(200, json.dumps(METRICS.system_info()), "application/json; charset=utf-8")
+elif path == "/api/health":
+self._send(200, json.dumps({"status": "ok", "version": "2.0.0"}), "application/json")
+else:
+self._send(404, json.dumps({"error": "not_found"}), "application/json")
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def local_ip():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]; s.close()
+return ip
+except Exception:
+return "127.0.0.1"
+
+
+def metrics_worker():
+while True:
+try:
+METRICS.collect()
+except Exception:
+pass
+time.sleep(1)
+
+
+def main():
+print()
+print(C + "═" * 70 + N)
+print(C + " NEXUS ULTRACONNECT PRO" + N)
+print(C + " Dashboard Ingénieur · Graphiques Vivants Interactifs" + N)
+print(C + "═" * 70 + N)
+print(" Auteur : Aissa Mohammedi (DGK)")
+print()
+print(" Port : " + str(PORT))
+print(" Local : http://127.0.0.1:" + str(PORT) + "/")
+print(" Réseau : http://" + local_ip() + ":" + str(PORT) + "/")
+print()
+
+worker = threading.Thread(target=metrics_worker, daemon=True)
+worker.start()
+ok("Collecteur démarré (1s d'intervalle)")
+print()
+
+try:
+with Server((HOST, PORT), Handler) as httpd:
+ok("Serveur prêt")
+print()
+print(G + " Ouvre :" + N)
+print(G + " http://127.0.0.1:" + str(PORT) + "/" + N)
+print()
+print(C + " Fonctionnalités du graphique :" + N)
+print(" • Hover → tooltip avec valeurs précises")
+print(" • Zoom → passe de 60 à 30 points")
+print(" • Pause → fige la collecte")
+print(" • Légende cliquable → afficher/masquer séries")
+print(" • Export → télécharge les données JSON")
+print()
+httpd.serve_forever()
+except KeyboardInterrupt:
+print()
+ok("Arrêté.")
+except OSError as e:
+err("Port " + str(PORT) + " : " + str(e))
+
+
+if __name__ == "__main__":
+main()
